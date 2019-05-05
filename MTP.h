@@ -24,16 +24,15 @@
 #ifndef MTP_H
 #define MTP_H
 
-#if !defined(USB_MTPDISK)
-#error "You need to select USB Type: 'MTP Disk (Experimental)'"
-#endif
+//#if (!defined(USB_MTPDISK) || !defined(USB_MIDI_AUDIO_SERIAL_MTP))
+//#error "You need to select USB Type: 'MTP Disk (Experimental)'"
+//#endif
 
 #include <Arduino.h>
 // #include <HardwareSerial.h>
 #include <usb_dev.h>
 #include <SPI.h>
 #include "SdFat.h"
-
 SdFatSdioEX SD;
 
 // TODO:
@@ -41,6 +40,12 @@ SdFatSdioEX SD;
 //   support serialflash
 //   partial object fetch/receive
 //   events (notify usb host when local storage changes)
+
+#define MTP_SERIALFLASH
+
+#ifdef MTP_SERIALFLASH
+#include <SerialFlash.h>
+#endif
 
 // These should probably be weak.
 void mtp_yield() {}
@@ -62,6 +67,9 @@ public:
   // Return free space in bytes.
   virtual uint64_t free() = 0;
 
+  //Return the name of this interface
+  virtual const char *name() = 0;
+  
   // parent = 0 means get all handles.
   // parent = 0xFFFFFFFF means get root folder.
   virtual void StartGetObjectHandles(uint32_t parent) = 0;
@@ -79,11 +87,211 @@ public:
         uint32_t bytes) = 0;
   virtual uint32_t Create(uint32_t parent,
         bool folder,
-        const char* filename) = 0;
+        const char* filename,
+		uint32_t size) = 0;
   virtual void write(const char* data, uint32_t size);
   virtual void close();
   virtual bool DeleteObject(uint32_t object) = 0;
 };
+
+#ifdef MTP_SERIALFLASH
+
+// Storage implementation for SerialFlash. SerialFlash needs to be already initialized.
+class MTPStorage_SF : public MTPStorageInterface {
+private:
+  //File index_;
+
+  //uint8_t mode_ = 0;
+  uint32_t open_file_ = 0xFFFFFFFEUL;
+  //File f_;
+  //uint32_t index_entries_ = 0;
+  SerialFlashFile file_;
+  
+  /*struct Record {
+    uint32_t parent;
+    uint32_t child;  // size stored here for files
+    uint32_t sibling;
+    uint8_t isdir;
+    uint8_t scanned;
+    char name[64];
+  };*/
+
+  const char *name() { return "Serial Flash"; }
+  bool readonly() { return false; }
+  bool has_directories() { return false; }
+  uint64_t size(){
+	 uint8_t buf[8];
+	 uint32_t s;
+	 //Serial.print("Size :");
+	 SerialFlash.readID(buf);
+	 s = SerialFlash.capacity(buf);
+	 //Serial.println(s);
+     return (uint64_t)s;
+  }
+
+  uint64_t free() {
+     //uint64_t volFree = SD.vol()->freeClusterCount();
+     //uint64_t ssize = (uint64_t)512 * volFree * (uint64_t)SD.vol()->blocksPerCluster();
+     //return ssize;
+ 	 uint8_t buf[8];
+	 //Serial.println("Free");
+	 SerialFlash.readID(buf);
+     return (uint64_t)SerialFlash.capacity(buf);
+ }
+
+  int _index;
+  void StartGetObjectHandles(uint32_t parent) override {
+	  //Serial.println("StartGetObjectHandles");
+	  SerialFlash.opendir();
+	  _index = 1;
+  }
+
+  uint32_t GetNextObjectHandle() override {
+    char filename[64];
+    uint32_t filesize;
+	  //Serial.print("GetNextObjectHandle : ");
+
+    if (SerialFlash.readdir(filename, sizeof(filename), filesize)) {
+      //Serial.println(_index);
+	  return _index++;
+    } else {
+      //Serial.println("No more objects");
+      return 0; // no more files
+    }
+  }
+
+  bool readName(char *name, uint32_t *size, uint32_t handle) {
+	uint32_t index = 1;
+	if (handle == 0) {
+      *name = 0;
+      *size = 0;
+	  return false;
+	}
+	SerialFlash.opendir();
+	while (SerialFlash.readdir(name, 64, *size)) {
+		if (index == handle) {
+			//File match
+			return true;
+		}
+		index++;
+	}
+    *name = 0;
+    *size = 0;
+	return false;	
+  }
+  
+  uint32_t readHandle(const char *name) {
+    char filename[64];
+    uint32_t filesize;
+	uint32_t handle = 1;
+	SerialFlash.opendir();
+	while (SerialFlash.readdir(filename, 64, filesize)) {
+		if (strcmp(filename, name) == 0) {
+			return handle;
+		}
+		handle++;
+	}
+	return 0;	
+  }
+  
+  void GetObjectInfo(uint32_t handle,
+        char* name,
+        uint32_t* size,
+        uint32_t* parent) override {
+			
+	//Serial.print("GetObjectInfo : ");
+	*parent = 0;
+	readName(name, size, handle);
+	//Serial.print(name);
+	//Serial.print(", Size: ");
+	//Serial.print(*size);
+	//Serial.print(", Handle: ");
+	//Serial.println(handle);
+  }
+
+  uint32_t GetSize(uint32_t handle) {
+    char filename[64];
+    uint32_t filesize;
+	if (readName(filename, &filesize, handle)) return filesize; 
+    return 0;
+  }
+
+  void read(uint32_t handle,
+        uint32_t pos,
+        char* out,
+        uint32_t bytes) override {
+    char filename[64];
+    uint32_t filesize;
+	//Serial.print("Read File Handle: ");
+	//Serial.print(handle);
+	//Serial.print(" at: ");
+	//Serial.print(pos);
+	//Serial.print(" len: ");
+	//Serial.print(bytes);
+	if (readName(filename, &filesize, handle)) {
+  	  //  Serial.print(" Name: ");
+		//Serial.print(filename);
+		mtp_lock_storage(true);
+		file_ = SerialFlash.open(filename);
+		file_.seek(pos);
+		file_.read(out, bytes);
+		mtp_lock_storage(false);
+		open_file_ = handle;
+	}
+	//Serial.println("");	
+  }
+
+  bool DeleteObject(uint32_t object) override {
+    // We can't actually delete the root folder,
+    // but if we deleted everything else, return true.
+    if (object == 0xFFFFFFFFUL) return true;
+    char filename[64];
+    uint32_t filesize;
+	if (readName(filename, &filesize, object)) {
+		return SerialFlash.remove(filename);
+	}
+    return false;
+  }
+
+  uint32_t Create(uint32_t parent,
+      bool folder,
+      const char* filename,
+	  uint32_t size) override {
+    uint32_t ret;
+    //if (parent == 0xFFFFFFFFUL) parent = 0;
+    //Record p = ReadIndexRecord(parent);
+    //Record r;
+    if (strlen(filename) > 62) return 0;
+	//Serial.print("Create : ");
+	//Serial.print(filename);
+	//Serial.print(", Size: ");
+	//Serial.println(size);
+    mtp_lock_storage(true);
+	ret = SerialFlash.create(filename, size);
+	if (ret) {
+		file_ = SerialFlash.open(filename);
+		open_file_ = readHandle(filename);
+	}
+    mtp_lock_storage(false);
+    return ret;
+  }
+
+  void write(const char* data, uint32_t bytes) override {
+	//Serial.print("Write Handle : ");
+	//Serial.print(open_file_);
+	//Serial.print(" Bytes: ");
+	//Serial.println(bytes);
+    mtp_lock_storage(true);
+    file_.write(data, bytes);
+    mtp_lock_storage(false);
+  }
+
+  void close() override {
+	//Serial.println("Close");
+	open_file_ = 0;
+  }
+};
+#endif
 
 // Storage implementation for SD. SD needs to be already initialized.
 class MTPStorage_SD : public MTPStorageInterface {
@@ -104,6 +312,7 @@ private:
     char name[64];
   };
 
+  const char *name() { return "SD Card"; }
   bool readonly() { return false; }
   bool has_directories() { return true; }
   uint64_t size(){
@@ -164,7 +373,7 @@ private:
     }
   }
 
-  void OpenFileByIndex(uint32_t i, uint8_t mode = O_RDONLY) {
+  void OpenFileByIndex(uint32_t i, oflag_t mode = O_RDONLY) {
     if (open_file_ == i && mode_ == mode)
       return;
     char filename[256];
@@ -350,7 +559,8 @@ private:
 
   uint32_t Create(uint32_t parent,
       bool folder,
-      const char* filename) override {
+      const char* filename,
+	  uint32_t size) override {
     uint32_t ret;
     if (parent == 0xFFFFFFFFUL) parent = 0;
     Record p = ReadIndexRecord(parent);
@@ -569,7 +779,7 @@ private:
     write64(storage_->size());  // max capacity
     write64(storage_->free());  // free space (100M)
     write32(0xFFFFFFFFUL);  // free space (objects)
-    writestring("SD Card");  // storage descriptor
+    writestring(storage_->name());  // storage descriptor
     writestring("");  // volume identifier
   }
 
@@ -737,7 +947,7 @@ inline MTPContainer *contains (usb_packet_t *receive_buffer){
     read32(); // storage
     bool dir = read16() == 0x3001; // format
     read16();  // protection
-    read32(); // size
+    uint32_t size = read32(); // size
     read16(); // thumb format
     read32(); // thumb size
     read32(); // thumb width
@@ -752,20 +962,25 @@ inline MTPContainer *contains (usb_packet_t *receive_buffer){
 
     readstring(filename);
     read_until_short_packet();  // ignores dates & keywords
-    return storage_->Create(parent, dir, filename);
+    return storage_->Create(parent, dir, filename, size);
   }
 
   void SendObject() {
     uint32_t len = ReadMTPHeader();
     while (len) {
+		//Serial.println(len);
       receive_buffer();
+		//Serial.print("Got Buffer, len:");
+		//Serial.println(data_buffer_->len);
       uint32_t to_copy = data_buffer_->len - data_buffer_->index;
       to_copy = min(to_copy, len);
       storage_->write((char*)(data_buffer_->buf + data_buffer_->index),
                     to_copy);
+		//Serial.println("Wrote data");
       data_buffer_->index += to_copy;
       len -= to_copy;
       if (data_buffer_->index == data_buffer_->len) {
+		  //Serial.println("New Buffer");
         usb_free(data_buffer_);
         data_buffer_ = NULL;
       }
